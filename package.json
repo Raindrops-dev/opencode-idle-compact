@@ -1,0 +1,12 @@
+{
+  "name": "opencode-idle-compact",
+  "version": "0.1.0",
+  "description": "OpenCode v2 plugin: 1-hour prompt cache, keep-warm and idle compaction, priced from the model catalog",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "license": "MIT",
+  "scripts": {
+    "test": "node test/test-anthropic-cache-v2.mjs && node test/test-anthropic-cache-v2-compaction.mjs"
+  }
+}
