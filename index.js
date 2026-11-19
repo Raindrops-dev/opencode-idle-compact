@@ -4,10 +4,11 @@
 // every 10 minutes or when a model is missing) and from the options below.
 //
 // TTL: OpenCode v2 marks Anthropic-style prompts with `cache_control: {type:"ephemeral"}` (5-minute TTL) by default.
-// OpenCode 2.3.0 can also set the lifetime itself (provider or model `settings.cache.ttl`). This plugin rewrites every explicit ephemeral breakpoint to `ttl:"1h"` on the native HTTP request when
-// the catalog entry of the model has a cache-write price above 0 (the provider bills cache writes: any tier). An unknown
-// model, or one without a cache-write price, is left untouched. A body with no breakpoint at all gets a top-level
-// `cache_control` only on routes listed in `topLevelCache`.
+// OpenCode 2.3.0 can also set the lifetime itself (provider or model `settings.cache.ttl`). This plugin rewrites every
+// explicit ephemeral breakpoint to `ttl:"1h"` on the native HTTP request when the catalog entry of the model has a
+// cache-write price above 0 (the provider bills cache writes: any tier). An unknown model, or one without a
+// cache-write price, is left untouched. A body with no breakpoint at all gets a top-level `cache_control` only on
+// routes listed in `topLevelCache`.
 //
 // Keep-warm (root sessions, explicit breakpoints only): shortly before the 1-hour entry expires, the plugin calls
 // `session.generate` as an authenticated carrier and swaps its body for the session's last real request with
@@ -30,7 +31,8 @@
 //   child  a child (subagent) session, `childIdleSeconds` after its last `context` event
 // All are queued (`delivery: "queue"`), wait for the session to be idle, and are dropped if the session saw new real
 // activity meanwhile. Size comes from the last primary response's input (including cache writes/reads) plus output;
-// without usable usage, fall back to ~4 chars/token over system and messages. Catalog economics decide (tier-aware at
+// without usable usage, fall back to ~4 chars/token over system and messages, replaced at the idle check by the usage
+// OpenCode recorded in the session (`ctx.session.context`, as core sizes a prompt). Catalog economics decide (tier-aware at
 // that size, `cold` = cache-write price or
 // else input price): saving = rate * (tokens - 4000) * cold - (tokens * read price + 4000 * output price), with rate 1
 // for warm/root and `childResumeRate` for child. The read is priced warm by default except for native compaction;
@@ -41,6 +43,11 @@
 // A session that went idle less than a quiet period ago (`time.idle` from `ctx.session.get`; without
 // it, a wait that took at least min(1 s, half the quiet period) counts as busy) is retried when the quiet period from
 // its idle time is over.
+// Every compaction carries an id derived from the session and its `time.idle` (when known), so that two processes
+// firing the same persisted deadline compact once (`compact.duplicate` in the second). A process that fires after
+// the first finished sees a newer `time.idle`; it then sizes the context returned by `ctx.session.context` (a completed
+// compaction with no usable anchor after it: ~4 chars/token over that context), so a fresh summary falls below
+// compactMinTokens. Known limits with two servers on one host: run one server per host.
 // After an idle compaction the session is remembered as compacted until its next real request: a native warm in
 // between is aborted before the network (it would only rebuild the dropped cache).
 // Warmers live in memory (dropped on unload). Idle-compaction deadlines are persisted in `ctx.storage` (`idle/<id>`)
@@ -76,6 +83,7 @@
 //   debug: boolean             log per-request cache usage and compaction skips to the log file (default false)
 //   logFile: string            default ~/.local/state/opencode/anthropic-cache.jsonl
 
+import { createHash } from "node:crypto";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -230,6 +238,39 @@ export function usageTokens(usage) {
   return Number.isFinite(tokens) && tokens > 0 ? tokens : undefined;
 }
 
+// Compaction id of one idle stretch, in OpenCode's message-id shape (`Identifier.create(false, idleAt)` with counter 1:
+// `msg_` + the low 48 bits of idleAt * 0x1000 + 1 as 12 hex chars + 14 base62 chars; here the tail comes from a hash of
+// session and idle time, not from random bytes). Every process that compacts this stretch sends the same id, so core admits it once.
+const BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+function idleCompactID(sessionID, idleAt) {
+  const time = ((BigInt(Math.trunc(idleAt)) * 0x1000n + 1n) & 0xffffffffffffn).toString(16).padStart(12, "0");
+  const hash = createHash("sha256").update(`${sessionID}:${idleAt}`).digest();
+  return "msg_" + time + Array.from(hash.subarray(0, 14), (b) => BASE62[b % 62]).join("");
+}
+// Core fails `session.compact` for a held id with `Session.CompactionConflictError` (a thrown object with `_tag`, no
+// message); over HTTP it is a ConflictError whose message says so.
+const isCompactionConflict = (error) => error?._tag === "Session.CompactionConflictError"
+  || /conflicts with an existing durable record/.test(String(error?.message ?? ""));
+// Prompt size as OpenCode core measures it (`estimatePrompt`): the newest assistant message of the current provider with
+// a measured prompt (`hasMeasuredPrompt`: no error, input + cache read + cache write above 0; another provider's count may
+// describe a window this one cannot replay), plus ~4 chars/token for what that usage did not cover: the anchor's own
+// settled local tool results (the provider never saw them) and every later message. undefined = no usable usage in the context.
+function contextTokens(messages, providerID) {
+  if (!Array.isArray(messages) || providerID === undefined) return undefined;
+  const i = messages.findLastIndex((m) => m?.type === "assistant" && m.model?.providerID === providerID && !m.error && m.tokens
+    && m.tokens.input + (m.tokens.cache?.read ?? 0) + (m.tokens.cache?.write ?? 0) > 0);
+  if (i < 0) return undefined;
+  const { input, output, reasoning, cache } = messages[i].tokens;
+  const parts = [input, output, reasoning, cache?.read, cache?.write];
+  if (!parts.every((n) => Number.isFinite(n) && n >= 0)) return undefined;
+  const measured = parts.reduce((sum, n) => sum + n, 0);
+  const results = (messages[i].content ?? [])
+    .filter((c) => c?.type === "tool" && c.executed !== true && (c.state?.status === "completed" || c.state?.status === "error"))
+    .map((c) => c.state.status === "error" ? { error: c.state.error, content: c.state.content ?? [] } : c.state.content).filter(Boolean); // as core replays them
+  const unseen = [...results, ...messages.slice(i + 1)];
+  return measured > 0 ? measured + (unseen.length ? JSON.stringify(unseen).length / 4 : 0) : undefined;
+}
+
 export default {
   id: ID,
   async setup(ctx) {
@@ -237,7 +278,7 @@ export default {
     const log = (entry) => {
       try {
         mkdirSync(dirname(opt.logFile), { recursive: true, mode: 0o700 });
-        appendFileSync(opt.logFile, JSON.stringify({ t: new Date().toISOString(), ...entry }) + "\n", { mode: 0o600 });
+        appendFileSync(opt.logFile, JSON.stringify({ t: new Date().toISOString(), pid: process.pid, ...entry }) + "\n", { mode: 0o600 });
       } catch { /* logging must never break a request */ }
     };
     if (opt.debug) log({ event: "setup", directory: ctx.location?.directory, ttl: opt.ttl, subagents: opt.subagents, keepWarm: opt.keepWarm, warmAfterMs: opt.warmAfterMs, maxIdleMs: opt.maxIdleMs, idleCompactMs: opt.idleCompactMs, childIdleMs: opt.childIdleMs });
@@ -279,7 +320,7 @@ export default {
     const saveIdle = (sessionID, t, due) => {
       t.due = due; // retain the deadline below threshold too: later provider usage can make it worth persisting
       if (!(t.tokens >= opt.compactMinTokens)) return dropIdle(sessionID);
-      const v = { dir, ws, child: !!t.child, warm: !!t.warm, model: t.model, tokens: t.tokens, due };
+      const v = { dir, ws, child: !!t.child, warm: !!t.warm, model: t.model, tokens: t.tokens, sized: t.sized, due };
       runOp(sessionID, () => ctx.storage?.set(`idle/${sessionID}`, v));
     };
     const dropIdle = (sessionID) => runOp(sessionID, () => ctx.storage?.remove(`idle/${sessionID}`));
@@ -361,8 +402,7 @@ export default {
       }
       if (scope !== "warm" && s) return skip("plugin-warmed"); // its own final tick decides
       // Provider input + output from the last primary response; ~4 chars/token only when usage is unavailable.
-      const tokens = t.tokens ?? (s && s.text.length / 4);
-      const estimatedTokens = Math.round(tokens);
+      let tokens = t.tokens ?? (s && s.text.length / 4);
       // Busy detection starts NOW, before the catalog await: a session busy when the timer fired must count as busy even
       // if it settles during that await, and catalog time must not count as wait time. The wait is timed inside the
       // wrapper. `w` never rejects ({ ok: false } = the wait failed), so no unhandled rejection.
@@ -370,6 +410,26 @@ export default {
       const w = (async () => {
         try { await ctx.session.wait?.({ sessionID }); return { ok: true, ms: Date.now() - started }; } catch { return { ok: false }; }
       })();
+      // The session's active context (an array), read once and only after the session settled, so it is never an in-flight sample.
+      const hasContext = typeof ctx.session.context === "function";
+      // A failed or non-array read is [] (no usable usage, nothing compacted), so it is not read a second time.
+      const readContext = async () => { try { const m = await ctx.session.context({ sessionID }); return Array.isArray(m) ? m : []; } catch { return []; } };
+      // No HTTP usage was seen (a route whose responses this plugin cannot read, such as a provider that keeps its own
+      // session): the character estimate overstates the real context, so size from the usage OpenCode recorded.
+      // A completed compaction with no usable anchor after it (another process or a hand compaction ran) replaced the basis
+      // of any earlier size, so then the whole context core would send is sized at ~4 chars/token, even over HTTP usage.
+      if (hasContext && (await w).ok) {
+        const was = t.sized;
+        const history = await readContext();
+        let measured = contextTokens(history, (t.model ?? s?.model)?.providerID);
+        const compacted = measured === undefined && history.some((m) => m?.type === "compaction" && m.status === "completed");
+        if (compacted) measured = JSON.stringify(history).length / 4;
+        // Apply only while nothing newer arrived during the read: same record, same activity, no HTTP usage since.
+        const fresh = compacted || (was !== "usage" && was !== "session");
+        if (measured !== undefined && fresh && track.get(sessionID) === t && t.seq === seq && !(t.sized === "usage" && was !== "usage")) { tokens = t.tokens = measured; t.sized = "session"; }
+        tokens = t.tokens ?? tokens; // HTTP usage of this same request may have arrived during the read: decide on that, not on the stale local value
+      }
+      const estimatedTokens = Math.round(tokens);
       const { why, basis } = await unworthy(t.model ?? s?.model, tokens, scope);
       // The session moved on while the catalog was read: this timer is stale, leave the new state alone.
       if (track.get(sessionID) !== t || (scope === "warm" && sessions.get(sessionID) !== s)) return skip("superseded");
@@ -410,11 +470,17 @@ export default {
       }
       stop(sessionID);
       t.compacted = true;
+      // One id per idle stretch: a second process that fires the same persisted deadline sends the same id.
+      const id = typeof idleAt === "number" && Number.isFinite(idleAt) ? idleCompactID(sessionID, idleAt) : undefined;
       try {
-        await ctx.session.compact({ sessionID, delivery: "queue" });
+        const res = await ctx.session.compact({ sessionID, ...(id && { id }), delivery: "queue" });
         dropIdle(sessionID);
-        log({ event: "compact.idle", sessionID, scope, estimatedTokens, ...(basis && { basis }) });
+        log({ event: "compact.idle", sessionID, scope, estimatedTokens, inboxID: res?.id ?? id, ...(basis && { basis }) });
       } catch (error) {
+        if (isCompactionConflict(error)) { // this idle stretch was already compacted, by another process
+          dropIdle(sessionID);
+          return log({ event: "compact.duplicate", sessionID, scope, inboxID: id });
+        }
         t.compacted = false;
         log({ event: "compact.failed", sessionID, scope, error: String(error?.message ?? error).slice(0, 200) });
       }
@@ -569,7 +635,7 @@ export default {
       const t = track.get(sessionID);
       if (t) {
         t.warm = true;
-        if (t.tokens === undefined) t.tokens = text.length / 4;
+        if (t.tokens === undefined) { t.tokens = text.length / 4; t.sized = "chars"; }
         if (opt.compactOnIdle && !excluded(sessionID)) saveIdle(sessionID, t, now + opt.maxIdleMs);
         else if (opt.compactOnIdle) dropIdle(sessionID);
       }
@@ -581,6 +647,7 @@ export default {
       const t = touch(sessionID);
       t.model = event.model;
       // New step's fallback; its primary response replaces this with provider usage once the stream ends.
+      t.sized = "chars";
       try { t.tokens = JSON.stringify({ system: event.system, messages: event.messages }).length / 4; } catch { t.tokens = undefined; }
       if (t.child === undefined) {
         try { t.child = !!(await ctx.session.get({ sessionID }))?.parentID; } catch { t.child = false; }
@@ -638,6 +705,7 @@ export default {
               if (track.get(sessionID) !== t || t.seq !== seq || t.compacted) return;
               const grew = !(t.tokens >= opt.compactMinTokens) && tokens >= opt.compactMinTokens;
               t.tokens = tokens;
+              t.sized = "usage";
               if (t.due !== undefined) {
                 // A long stream may have outlasted a below-threshold idle check; warm sessions keep their own final tick.
                 if (grew && !sessions.has(sessionID) && (!t.timer || t.timer._destroyed)) armIdle(sessionID, t.due);
@@ -693,6 +761,7 @@ export default {
             t.warm = !!v.warm;
             t.model = v.model;
             t.tokens = v.tokens;
+            t.sized = v.sized === "usage" || v.sized === "session" ? v.sized : "chars"; // records from older versions: unknown
             t.due = v.due;
             const seq = t.seq;
             t.timer = setTimeout(() => void idleCompact(sessionID, child ? "child" : "root", seq), Math.max(0, v.due - now));

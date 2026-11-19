@@ -79,8 +79,9 @@ meantime. If the session went idle less than a quiet period ago, the plugin wait
 For priced models, the plugin compacts only when both of these are true:
 
 - The context has at least `compactMinTokens` tokens (default 100000). The size comes from the token counts in the
-  provider's last reply. Without those counts, the plugin estimates about 4 characters per token over the serialized
-  request.
+  provider's last reply. Without those counts, the plugin uses the token usage OpenCode recorded with the newest usable
+  answer of the same provider, plus about 4 characters per token for what that usage did not cover. Without either, it
+  estimates about 4 characters per token over the serialized request.
 - The expected saving is at least `compactSaveMin` US dollars (default 0.02).
 
 The expected saving is an estimate. It assumes that the session is resumed later, the summary is about 4000 tokens, and
@@ -177,6 +178,7 @@ The plugin uses these parts of the plugin context (`ctx`):
 | `ctx.session.compact` | Asks OpenCode to compact an idle session (`delivery: "queue"`) |
 | `ctx.session.get` | Tells root from child sessions and reads when a session went idle |
 | `ctx.session.wait` | Waits until a session is idle |
+| `ctx.session.context` | Reads the session's active context to size it from the recorded token usage |
 | `ctx.model.list` | Reads the catalog (cached, refreshed every 10 minutes) |
 | `ctx.storage` (`set`, `remove`, `scan`) | Keeps idle-compaction deadlines across plugin reloads |
 
@@ -308,12 +310,17 @@ This is a keep-alive request. Do not perform any work or use tools. Reply with e
   up to 32 sessions. It copies the system prompt, the tools and the thinking settings from it into OpenCode's own warm
   requests, under the conditions in [OpenCode's own cache settings](#opencodes-own-cache-settings).
 - **Storage.** For each pending idle compaction, the plugin stores the folder, the workspace ID, the scope flags,
-  the model, the token count and the deadline in `ctx.storage`. It stores no prompt or reply text there.
+  the model, the token count, where that count came from and the deadline in `ctx.storage`. It stores no prompt or
+  reply text there.
+- **Session reads.** When an idle timer reaches its size check and the session has settled, the plugin reads the
+  session's active context with `ctx.session.context`, where OpenCode offers it, to size it from the recorded token
+  usage. It keeps only the resulting number.
 - **Network.** The plugin makes no network call of its own. Its requests go only through OpenCode's session API.
 - **Log.** The plugin writes JSON lines to `~/.local/state/opencode/anthropic-cache.jsonl` by default. When the plugin
-  creates the file, it creates it with mode 600. Each line has a time (`t`) and an event name (`event`). The other
-  fields are metadata:
+  creates the file, it creates it with mode 600. Each line has a time (`t`), the ID of the OpenCode process that wrote
+  it (`pid`) and an event name (`event`). The other fields are metadata:
   - session ID, scope, reason, estimated token count, basis, provider and model names, request kind and HTTP status;
+  - the ID of the compaction request when known (`inboxID`, on `compact.idle` and `compact.duplicate`);
   - folder path (at setup);
   - counts (re-armed and dropped compactions);
   - error messages as received, cut to 200 characters and not redacted;
@@ -331,6 +338,15 @@ This is a keep-alive request. Do not perform any work or use tools. Reply with e
   compacting.
 - **`compact.idle` in the log** means that OpenCode accepted the compaction request. It does not mean that the
   compaction finished.
+- **One OpenCode server per host.** Two servers that share one database also share the stored deadlines. When
+  OpenCode reports when the session went idle, the idle compaction carries an ID derived from the session and that
+  time, so OpenCode accepts it once. While the first request is still pending, the second server gets the same request
+  back and logs `compact.idle` with the same `inboxID`; once it has run, the second server logs `compact.duplicate`.
+  Without that idle time there is no shared ID. Some timing cases with two servers can still compact a session twice.
+- **Routes without readable usage.** When the plugin never sees the provider's usage in an HTTP response, it sizes
+  the session from the usage OpenCode recorded with the newest usable answer (no error, a positive prompt count) of the
+  same provider, plus about 4 characters per token for what that usage did not cover. After a compaction with no such
+  answer since, or when the context cannot be read, it estimates about 4 characters per token.
 - **OpenCode chooses the summary model.** The plugin never calls a model itself for the summary.
 
 ## Tests

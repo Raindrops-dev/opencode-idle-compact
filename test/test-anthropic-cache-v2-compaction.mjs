@@ -7,6 +7,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 import plugin from "../index.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -30,6 +31,12 @@ const CATALOG = [
   m("acme", "zero-cost", [c(0, 0, 0, 0)], 1_000_000), // priced at zero: economics apply (saving 0), not "unpriced"
   { ...m("omni", "native-compact", [c(2, 10, 0.2, 0)], 1_000_000), settings: { compaction: { type: "native" } } },
 ];
+// The id the plugin must send for one idle stretch, written out from the spec (OpenCode's `Identifier.create(false, idleAt)`
+// with counter 1, tail from sha256 instead of random bytes), not by calling the plugin.
+const B62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+const hex12 = (idleAt) => ((BigInt(idleAt) * 4096n + 1n) & (2n ** 48n - 1n)).toString(16).padStart(12, "0");
+const idleCompactID = (sessionID, idleAt) =>
+  "msg_" + hex12(idleAt) + [...createHash("sha256").update(`${sessionID}:${idleAt}`).digest().subarray(0, 14)].map((b) => B62[b % 62]).join("");
 const ref = (s) => { const i = s.indexOf("/"); return { providerID: s.slice(0, i), id: s.slice(i + 1) }; };
 
 function fakeStorage(pageSize = 2) {
@@ -49,9 +56,9 @@ function fakeStorage(pageSize = 2) {
   };
 }
 
-async function harness(options = {}, { parents = {}, waitFor, genText, idleAt = {}, storage, location } = {}) {
+async function harness(options = {}, { parents = {}, waitFor, genText, idleAt = {}, storage, location, compactFn, contextFn } = {}) {
   const logFile = join(dir, `log-${Math.random()}.jsonl`);
-  const hooks = {}, generated = [], compacted = [], texts = [], waits = [];
+  const hooks = {}, generated = [], compacted = [], texts = [], waits = [], contexts = [];
   const ctx = {
     options: { logFile, flatRate: ["nominal/*"], topLevelCache: ["gate/*"], ...options },
     ...(location ? { location } : {}),
@@ -61,14 +68,15 @@ async function harness(options = {}, { parents = {}, waitFor, genText, idleAt = 
     session: {
       hook: async (name, fn) => { hooks[name] = fn; },
       generate: async (input) => { generated.push(input); const r = ctx.onGenerate ? await ctx.onGenerate(input) : undefined; return r ?? { text: "" }; },
-      compact: async (input) => { compacted.push(input); return {}; },
+      compact: async (input) => { compacted.push(input); return compactFn ? compactFn(input) : {}; },
+      ...(contextFn ? { context: async (input) => { contexts.push(input); return contextFn(input); } } : {}),
       get: async ({ sessionID }) => ({ id: sessionID, parentID: parents[sessionID], time: { created: 0, updated: 0, idle: idleAt[sessionID]?.() } }),
       wait: async ({ sessionID }) => { waits.push(sessionID); if (waitFor) await waitFor(sessionID); },
     },
   };
   const cleanup = await plugin.setup(ctx);
   const log = () => { try { return readFileSync(logFile, "utf8"); } catch { return ""; } };
-  return { hooks, generated, compacted, texts, waits, ctx, cleanup, log };
+  return { hooks, generated, compacted, texts, waits, contexts, ctx, cleanup, log };
 }
 
 // A messages body of about `tokens` tokens (estimate = JSON chars / 4), optionally with explicit breakpoints.
@@ -169,7 +177,7 @@ const compactionEvent = (sessionID, model, b) => ({ ...contextEvent(sessionID, m
     await sleep(30);
     assert.equal(h.compacted.length, 0, "late usage still respects the quiet period after idle");
     await sleep(100);
-    assert.deepEqual(h.compacted, [{ sessionID: "late", delivery: "queue" }], "child: timer skipped small estimate, then late usage -> compacted");
+    assert.deepEqual(h.compacted, [{ sessionID: "late", id: idleCompactID("late", idleSince), delivery: "queue" }], "child: timer skipped small estimate, then late usage -> compacted");
     assert.match(h.log(), /"reason":"busy: quiet period from time.idle"/);
     assert.equal(storage.map.has("idle/late"), false, "late child compaction removes the deadline");
     h.cleanup();
@@ -298,7 +306,7 @@ const compactionEvent = (sessionID, model, b) => ({ ...contextEvent(sessionID, m
     assert.equal(h.waits.length, 2, "second final tick is waiting");
     release();
     await sleep(30);
-    assert.deepEqual(h.compacted, [{ sessionID: "duplicate", delivery: "queue" }], "overlapping final ticks compact once");
+    assert.deepEqual(h.compacted, [{ sessionID: "duplicate", id: idleCompactID("duplicate", 0), delivery: "queue" }], "overlapping final ticks compact once");
   } finally {
     release();
     h.cleanup();
@@ -607,7 +615,7 @@ const compactionEvent = (sessionID, model, b) => ({ ...contextEvent(sessionID, m
   await sleep(90); // timer at 60; idle since 55 -> re-armed for the remainder (until ~115)
   assert.equal(h.compacted.length, 0, "not compacted 5 ms after the session became idle");
   await sleep(60); // ~150
-  assert.deepEqual(h.compacted, [{ sessionID: "ti", delivery: "queue" }], "compacted one quiet period after time.idle");
+  assert.deepEqual(h.compacted, [{ sessionID: "ti", id: idleCompactID("ti", t0 + 55), delivery: "queue" }], "compacted one quiet period after time.idle");
   h.cleanup();
 }
 
@@ -964,6 +972,367 @@ const compactionEvent = (sessionID, model, b) => ({ ...contextEvent(sessionID, m
     b.cleanup();
     assert.deepEqual(b.compacted, [{ sessionID: "rearm-ok", delivery: "queue" }], "restored excluded session does not fire; non-excluded does");
     assert.equal(storage.map.has("idle/rearm-ex"), false, "excluded session's persisted deadline dropped on restore");
+  }
+}
+
+// 11. one compaction per idle stretch across processes. The id of a compaction is derived from the session and its
+//     time.idle, so a second process that fires the same persisted deadline sends the same id and core admits it once.
+const events = (h) => h.log().trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
+// A fake of core's admitCompaction: a held id returns its item; once delivered, the same id is a conflict. Like the real
+// plugin API (`packages/plugin/src/promise/adapter.ts`), `compact` returns the admitted item and `context` the message
+// array themselves, with no `{ data }` wrapper.
+function fakeCore() {
+  const core = { items: new Map(), delivered: new Set(), admitted: 0, messages: [] };
+  core.compact = async ({ sessionID, id }) => {
+    if (core.delivered.has(id)) throw Object.assign(new Error(""), { _tag: "Session.CompactionConflictError", sessionID, inputID: id });
+    if (!core.items.has(id)) { core.items.set(id, { id, type: "compaction" }); core.admitted += 1; }
+    return core.items.get(id);
+  };
+  core.context = async () => core.messages;
+  return core;
+}
+{
+  const loc = { directory: "/proj/x-process", workspaceID: "ws1" };
+  const idle0 = Date.now() - 5000; // idle long before the deadline: no busy re-arm
+  // A. two processes, one storage, one core. The first compacts and its item is delivered; the second then fires the same
+  //    deadline: same id, nothing admitted twice, logged as a duplicate, not a failure.
+  for (const delivered of [true, false]) {
+    const core = fakeCore(), storage = fakeStorage();
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const h1 = await harness({ idleCompactMinutes: 80 / MIN }, { storage, location: loc, compactFn: core.compact, idleAt: { dup: () => idle0 } });
+    await turn(h1, "dup", "omni/router-gpt", body(150_000, { breakpoints: false }));
+    await sleep(15);
+    const h2 = await harness({ idleCompactMinutes: 80 / MIN }, { storage, location: loc, compactFn: core.compact, idleAt: { dup: () => idle0 }, waitFor: () => gate });
+    await sleep(15);
+    assert.match(h2.log(), /"compact.rearmed"/, "the second process restored the first one's persisted deadline");
+    for (let i = 0; i < 100 && h1.compacted.length < 1; i++) await sleep(10);
+    assert.equal(h1.compacted.length, 1, "first process compacted");
+    if (delivered) for (const id of core.items.keys()) core.delivered.add(id);
+    release();
+    for (let i = 0; i < 100 && h2.compacted.length < 1; i++) await sleep(10);
+    assert.equal(h2.compacted.length, 1, "second process fired the same deadline");
+    await sleep(20);
+    const want = idleCompactID("dup", idle0);
+    assert.deepEqual(h2.compacted, [{ sessionID: "dup", id: want, delivery: "queue" }]);
+    assert.deepEqual(h1.compacted, h2.compacted, "both processes send the identical id");
+    assert.equal(core.admitted, 1, "exactly one compaction admitted");
+    const e1 = events(h1).filter((e) => e.event.startsWith("compact.") && e.sessionID === "dup");
+    const e2 = events(h2).filter((e) => e.event.startsWith("compact.") && e.sessionID === "dup");
+    assert.deepEqual(e1.map((e) => e.event), ["compact.idle"]);
+    assert.equal(e1[0].inboxID, want, "D: compact.idle carries the returned item's id");
+    if (delivered) {
+      assert.deepEqual(e2.map((e) => e.event), ["compact.duplicate"], "delivered: logged as a duplicate, not a failure");
+      assert.deepEqual({ ...e2[0], t: undefined, pid: undefined }, { t: undefined, pid: undefined, event: "compact.duplicate", sessionID: "dup", scope: "root", inboxID: want });
+    } else {
+      assert.deepEqual(e2.map((e) => e.event), ["compact.idle"], "pending: core returns the held item");
+      assert.equal(e2[0].inboxID, want, "same inbox item in both logs");
+    }
+    assert.equal(storage.map.has("idle/dup"), false, "no deadline left in storage");
+    h1.cleanup(); h2.cleanup();
+  }
+  // Other errors keep today's handling: compact.failed, and the session may be compacted again.
+  {
+    const h = await harness({ idleCompactMinutes: 20 / MIN }, { compactFn: async () => { throw new Error("boom"); }, idleAt: { bad: () => idle0 } });
+    await turn(h, "bad", "omni/router-gpt", body(150_000, { breakpoints: false }));
+    await sleep(80);
+    const names = events(h).filter((e) => e.sessionID === "bad").map((e) => e.event);
+    assert.deepEqual(names, ["compact.failed"], "other errors: compact.failed");
+    h.cleanup();
+  }
+  // A2. process A compacts and finishes, which advances time.idle: B's timer then fires with a newer time.idle, so the idle-keyed
+  //     id differs. B reads the context and sizes it: a completed compaction with no anchor after it means the old size lost its
+  //     basis, so the whole context (the summary plus what came after) is sized at ~4 chars/token and the economics decide.
+  //     The old tracked size is 150,000 either from the character estimate or from HTTP usage; the result is the same.
+  const summary = { type: "compaction", status: "completed", reason: "auto", summary: "S".repeat(4000) };
+  for (const http of [false, true]) for (const [name, after, calls] of [
+    ["only an idle marker after the compaction", [{ type: "idle", outcome: "succeeded" }], 0],
+    ["nothing after the compaction", [], 0],
+    ["a short skill entry", [{ type: "skill", name: "s", text: "short" }], 0],
+    ["a short system entry", [{ type: "system", text: "short" }], 0],
+    ["an effort switch", [{ type: "model-switched" }, { type: "agent-switched" }], 0],
+    ["a short user turn", [{ type: "user", text: "more" }], 0],
+    ["a short assistant turn without usage", [{ type: "assistant", content: [] }], 0],
+    // a large tail still compacts: a shell row of 600,000 characters is ~150,000 tokens (a background one, status exited, too)
+    ["a large shell row after the compaction", [{ type: "shell", command: "cat big", status: "exited", metadata: { background: true }, output: { output: "x".repeat(600_000) } }], 1],
+    ["a large user turn after the compaction", [{ type: "user", text: "x".repeat(600_000) }], 1],
+  ]) {
+    const name2 = `${name}${http ? " (HTTP-sized)" : ""}`;
+    const core = fakeCore(), storage = fakeStorage();
+    const loc = { directory: "/proj/x-finished", workspaceID: "ws1" };
+    core.messages = [{ type: "user", text: "hi" }, { type: "assistant", model: { providerID: "omni", id: "router-gpt" }, content: [], tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 150000, write: 0 } } }];
+    let idleB = idle0, release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const h1 = await harness({ idleCompactMinutes: 80 / MIN }, { storage, location: loc, compactFn: core.compact, contextFn: core.context, idleAt: { fin: () => idle0 } });
+    await turn(h1, "fin", "omni/router-gpt", body(150_000, { breakpoints: false }), {}, http ? new Response(JSON.stringify({ usage: { input_tokens: 149000, output_tokens: 1000 } })) : undefined);
+    await sleep(15);
+    const h2 = await harness({ debug: true, idleCompactMinutes: 80 / MIN }, { storage, location: loc, compactFn: core.compact, contextFn: core.context, idleAt: { fin: () => idleB }, waitFor: () => gate });
+    await sleep(15);
+    assert.match(h2.log(), /"compact.rearmed"/, `${name2}: the second process restored the deadline`);
+    for (let i = 0; i < 100 && h1.compacted.length < 1; i++) await sleep(10);
+    assert.equal(h1.compacted.length, 1, `${name2}: first process compacted`);
+    // the compaction ran: the context is now the compaction, then what came after; time.idle moved on
+    core.messages = [summary, ...after];
+    idleB = Date.now() - 1000;
+    release();
+    await sleep(120);
+    assert.equal(h2.compacted.length, calls, `${name2}: second process made ${calls} compaction call(s)`);
+    if (!calls) {
+      assert.match(h2.log(), /"compact.skip"[^\n]*"sessionID":"fin"[^\n]*"reason":"below compactMinTokens"/, `${name2}: sized from the small context`);
+      assert.equal(storage.map.has("idle/fin"), false, `${name2}: deadline dropped`);
+    } else assert.notEqual(h2.compacted[0].id, h1.compacted[0].id, `${name2}: a newer idle stretch has its own id`);
+    h1.cleanup(); h2.cleanup();
+  }
+  // a compaction that did not complete is no proof; neither is a context without one
+  for (const [name, messages] of [
+    ["failed compaction", [{ type: "compaction", status: "failed" }]],
+    ["running compaction", [{ type: "compaction", status: "running" }]],
+    ["no compaction", [{ type: "idle" }]],
+  ]) {
+    const h = await harness({ idleCompactMinutes: 20 / MIN }, { contextFn: async () => messages, idleAt: { nc: () => idle0 } });
+    await turn(h, "nc", "omni/router-gpt", body(150_000, { breakpoints: false }));
+    await sleep(70);
+    assert.equal(h.compacted.length, 1, `${name}: still compacts`);
+    h.cleanup();
+  }
+  // B. id shape and determinism
+  {
+    const idleAt = 1763565050735;
+    const ids = [];
+    for (const [sessionID, at] of [["ses_a", idleAt], ["ses_a", idleAt], ["ses_a", idleAt + 1], ["ses_b", idleAt]]) {
+      const h = await harness({ idleCompactMinutes: 20 / MIN }, { idleAt: { [sessionID]: () => at } });
+      await turn(h, sessionID, "omni/router-gpt", body(150_000, { breakpoints: false }));
+      await sleep(70);
+      assert.equal(h.compacted.length, 1);
+      ids.push(h.compacted[0].id);
+      h.cleanup();
+    }
+    for (const id of ids) assert.match(id, /^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+    assert.equal(ids[0], ids[1], "same (session, time.idle) -> same id");
+    assert.notEqual(ids[0], ids[2], "different time.idle -> different id");
+    assert.notEqual(ids[0], ids[3], "different session -> different id");
+    assert.equal(ids[0].slice(4, 16), ((BigInt(idleAt) * 4096n + 1n) & (2n ** 48n - 1n)).toString(16).padStart(12, "0"), "time chars of idleAt * 4096 + 1, low 48 bits");
+  }
+  // C. without time.idle: no id; D: inboxID falls back to nothing when core returns no item
+  {
+    const h = await harness({ idleCompactMinutes: 20 / MIN });
+    await turn(h, "noidle", "omni/router-gpt", body(150_000, { breakpoints: false }));
+    await sleep(70);
+    assert.deepEqual(h.compacted, [{ sessionID: "noidle", delivery: "queue" }]);
+    assert.equal("id" in h.compacted[0], false, "no time.idle -> compact called without id");
+    assert.equal(events(h).find((e) => e.event === "compact.idle")?.inboxID, undefined);
+    h.cleanup();
+  }
+  // D. the fake's returned id, even when it differs from the one sent
+  {
+    const h = await harness({ idleCompactMinutes: 20 / MIN }, { compactFn: async () => ({ id: "msg_returned" }), idleAt: { ret: () => idle0 } });
+    await turn(h, "ret", "omni/router-gpt", body(150_000, { breakpoints: false }));
+    await sleep(70);
+    assert.equal(events(h).find((e) => e.event === "compact.idle")?.inboxID, "msg_returned", "inboxID is the returned item's id");
+    h.cleanup();
+  }
+}
+
+// 12. when no provider usage arrived, size from the usage OpenCode recorded (session.context), as core's estimatePrompt does.
+{
+  const claude = { input: 2, output: 250, reasoning: 0, cache: { read: 648967, write: 1632 } }; // 650851 in total
+  const assistant = (tokens, extra = {}) => ({ type: "assistant", id: "msg_a", model: { providerID: "omni", id: "router-gpt" }, content: [], ...(tokens && { tokens }), ...extra });
+  const user = (text) => ({ type: "user", id: "msg_u", text });
+  const sized = (h) => events(h).find((e) => e.event === "compact.idle")?.estimatedTokens;
+  // E. a route that never produces usage, with a history of over 1M characters-per-4: the recorded usage wins
+  {
+    const big = body(1_100_000, { breakpoints: false });
+    const chars = Math.round(JSON.stringify({ system: big.system, messages: big.messages }).length / 4);
+    assert.ok(chars > 1_000_000);
+    const h = await harness({ idleCompactMinutes: 20 / MIN }, { contextFn: async () => [user("hi"), assistant(claude)] });
+    await turn(h, "claude-agent", "omni/router-gpt", big);
+    await sleep(120);
+    assert.equal(h.compacted.length, 1);
+    assert.equal(sized(h), 650851, "estimatedTokens from the session's recorded usage, not the character estimate");
+    assert.deepEqual(h.contexts, [{ sessionID: "claude-agent" }]);
+    h.cleanup();
+  }
+  // messages after the newest assistant message with tokens count at ~4 chars/token; an assistant message without tokens
+  // or with an error is skipped
+  {
+    const tail = [assistant(undefined), user("x".repeat(4000))];
+    const messages = [assistant({ ...claude, input: 1 }), assistant(claude), ...tail, assistant({ ...claude, input: 9 }, { error: { type: "x" } })];
+    const after = [assistant(undefined), user("x".repeat(4000)), messages[4]];
+    const h = await harness({ idleCompactMinutes: 20 / MIN }, { contextFn: async () => messages });
+    await turn(h, "tail", "omni/router-gpt", body(150_000, { breakpoints: false }));
+    await sleep(120);
+    assert.equal(sized(h), Math.round(650851 + JSON.stringify(after).length / 4));
+    h.cleanup();
+  }
+  // a large character estimate, a small recorded size: not compacted (the session did not need it)
+  {
+    const h = await harness({ debug: true, idleCompactMinutes: 20 / MIN }, { contextFn: async () => [assistant({ input: 1000, output: 100, reasoning: 0, cache: { read: 48000, write: 0 } })] });
+    await turn(h, "small-real", "omni/router-gpt", body(150_000, { breakpoints: false }));
+    await sleep(120);
+    assert.equal(h.compacted.length, 0, "recorded usage below compactMinTokens -> not compacted");
+    assert.match(h.log(), /"compact.skip"[^\n]*"sessionID":"small-real"[^\n]*"reason":"below compactMinTokens"/);
+    h.cleanup();
+  }
+  // F. no usable usage in the context, or the read fails: the character estimate, as before
+  for (const [name, contextFn] of [
+    ["no assistant message", async () => [user("hi")]],
+    ["assistant without tokens", async () => [user("hi"), assistant(undefined)]],
+    ["empty context", async () => []],
+    ["not an array", async () => ({})],
+    ["wrapped in { data }: only the array itself is accepted", async () => ({ data: [assistant(claude)] })],
+    ["zero usage", async () => [assistant({ input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } })]],
+    ["read fails", async () => { throw new Error("context unavailable"); }],
+    // 6. only the current provider's count counts (core's hasMeasuredPrompt): after a provider switch there is none
+    ["only another provider's usage", async () => [assistant(claude, { model: { providerID: "other", id: "x" } })]],
+    ["no provider on the assistant message", async () => [assistant(claude, { model: undefined })]],
+  ]) {
+    const b = body(150_000, { breakpoints: false });
+    const h = await harness({ idleCompactMinutes: 20 / MIN }, { contextFn });
+    await turn(h, "fb", "omni/router-gpt", b);
+    await sleep(120);
+    assert.equal(h.contexts.length, 1, `${name}: context read once`);
+    assert.equal(h.compacted.length, 1, `${name}: compacted on the character estimate`);
+    assert.equal(sized(h), Math.round(JSON.stringify({ system: b.system, messages: b.messages }).length / 4), `${name}: character estimate`);
+    h.cleanup();
+  }
+  // F. provider usage seen: the size stays the provider usage (the context is read once, for the already-compacted check only)
+  {
+    const h = await harness({ idleCompactMinutes: 20 / MIN }, { contextFn: async () => [assistant(claude)] });
+    await turn(h, "usage", "omni/router-gpt", body(150_000, { breakpoints: false }), {}, new Response(JSON.stringify({ usage: { input_tokens: 99000, output_tokens: 1000 } })));
+    await sleep(120);
+    assert.equal(h.compacted.length, 1);
+    assert.equal(sized(h), 100000, "provider usage sizes the session, not the recorded usage");
+    assert.equal(h.contexts.length, 1, "one context read (already-compacted check)");
+    h.cleanup();
+  }
+  // a plugin context without session.context (older OpenCode): the character estimate
+  {
+    const h = await harness({ idleCompactMinutes: 20 / MIN });
+    assert.equal(h.ctx.session.context, undefined);
+    await turn(h, "old", "omni/router-gpt", body(150_000, { breakpoints: false }));
+    await sleep(120);
+    assert.equal(h.compacted.length, 1, "no session.context: compacted on the character estimate as before");
+    h.cleanup();
+  }
+  // the size basis is persisted and restored: a restored character estimate reads the context, a restored usage size does not
+  {
+    const loc = { directory: "/proj/sized", workspaceID: "ws1" };
+    // the context is read once either way (already-compacted check); only the chars basis takes its size from it
+    for (const [response, basis, reads] of [[new Response("{}"), "chars", 1], [new Response(JSON.stringify({ usage: { input_tokens: 99000, output_tokens: 1000 } })), "usage", 0]]) {
+      const storage = fakeStorage();
+      const a = await harness({ idleCompactMinutes: 60 / MIN }, { storage, location: loc });
+      await turn(a, "persist", "omni/router-gpt", body(150_000, { breakpoints: false }), {}, response);
+      await sleep(20);
+      a.cleanup();
+      assert.equal(storage.map.get("idle/persist")?.sized, basis, `${basis}: basis persisted`);
+      const b = await harness({ idleCompactMinutes: 5000 / MIN }, { storage, location: loc, contextFn: async () => [assistant({ ...claude, cache: { read: 148967, write: 1632 } })] });
+      await sleep(100);
+      assert.equal(b.compacted.length, 1, `${basis}: restored deadline fired`);
+      assert.equal(b.contexts.length, 1, `${basis}: one context read`);
+      assert.equal(sized(b), reads ? 150851 : 100000);
+      b.cleanup();
+    }
+  }
+  // 5. the anchor's settled local tool results were never seen by the provider: counted at ~4 chars/token like core.
+  //    Hosted (executed) tools and unsettled ones are not.
+  {
+    const measured = { input: 1000, output: 100, reasoning: 0, cache: { read: 58900, write: 0 } }; // 60000
+    const local = [{ type: "text", text: "x".repeat(240_000) }];
+    const tool = (state, extra = {}) => ({ type: "tool", id: "t", name: "read", state, time: {}, ...extra });
+    const done = tool({ status: "completed", input: {}, content: local });
+    // core replays an error-state tool as `{ error, content: content ?? [] }`, so the error text counts too.
+    const bigError = { type: "tool.execution", message: "e".repeat(240_000) };
+    const replayed = (error, content = []) => Math.round(60000 + JSON.stringify([{ error, content }]).length / 4);
+    for (const [name, content, want] of [
+      ["settled local tool result", [done], Math.round(60000 + JSON.stringify([local]).length / 4)],
+      ["error with content", [tool({ status: "error", input: {}, error: { type: "x", message: "m" }, content: local })], replayed({ type: "x", message: "m" }, local)],
+      ["hosted (executed) tool", [{ ...done, executed: true }], 60000],
+      ["running tool", [tool({ status: "running", input: {}, metadata: {} })], 60000],
+      ["error without content", [tool({ status: "error", input: {}, error: { type: "x", message: "m" } })], 60000],
+      ["error with a 240,000-character message", [tool({ status: "error", input: {}, error: bigError })], replayed(bigError)],
+    ]) {
+      const h = await harness({ debug: true, idleCompactMinutes: 20 / MIN }, { contextFn: async () => [assistant(measured, { content })] });
+      await turn(h, "tools", "omni/router-gpt", body(150_000, { breakpoints: false }));
+      await sleep(120);
+      if (want >= 100000) {
+        assert.equal(h.compacted.length, 1, `${name}: compacted`);
+        assert.equal(sized(h), want, `${name}: measured + local tool output`);
+        assert.ok(Math.abs(want - 120000) < 100, "about 120,000");
+      } else {
+        assert.equal(h.compacted.length, 0, `${name}: 60,000 stays below compactMinTokens`);
+        assert.match(h.log(), /"reason":"below compactMinTokens"/);
+      }
+      h.cleanup();
+    }
+  }
+  // 3. the context is read only after the session settled, and its size is what the economics check sees. A session busy when
+  //    the timer fires, still showing an old 50,000 record, finishes at 150,000: it is compacted, not skipped on the old size.
+  {
+    let settled = false, release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const old = [assistant({ input: 1000, output: 100, reasoning: 0, cache: { read: 48900, write: 0 } })]; // 50,000
+    const fresh = [assistant(claude)];
+    const h = await harness({ idleCompactMinutes: 20 / MIN }, { contextFn: async () => (settled ? fresh : old), waitFor: () => gate, idleAt: { busy: () => Date.now() - 5000 } });
+    await turn(h, "busy", "omni/router-gpt", body(150_000, { breakpoints: false }));
+    await sleep(120);
+    assert.deepEqual(h.waits, ["busy"], "the timer fired and is waiting for the session");
+    assert.deepEqual(h.contexts, [], "no context read while the session is busy");
+    assert.equal(h.compacted.length, 0);
+    settled = true; release();
+    await sleep(120);
+    assert.deepEqual(h.contexts, [{ sessionID: "busy" }], "one read, after the wait");
+    assert.equal(h.compacted.length, 1);
+    assert.equal(sized(h), 650851, "sized from the settled context");
+    h.cleanup();
+  }
+  // 3. a read that comes back after newer activity is not applied
+  {
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const h = await harness({ idleCompactMinutes: 20 / MIN }, { contextFn: async () => { await gate; return [assistant(claude)]; }, idleAt: { race: () => Date.now() - 5000 } });
+    await turn(h, "race", "omni/router-gpt", body(150_000, { breakpoints: false }));
+    await sleep(60);
+    assert.equal(h.contexts.length, 1, "read in flight");
+    await turn(h, "race", "omni/router-gpt", body(150_000, { breakpoints: false }), {}, new Response(JSON.stringify({ usage: { input_tokens: 99000, output_tokens: 1000 } })));
+    release();
+    await sleep(120);
+    assert.equal(h.compacted.length, 1, "only the newer activity's timer compacts");
+    assert.equal(sized(h), 100000, "the old read did not overwrite the newer provider usage");
+    h.cleanup();
+  }
+  // 1. HTTP usage of the SAME request arrives while the context is being read: the decision uses that usage (50,000, below
+  //    compactMinTokens), not the character estimate (150,000) the timer started with.
+  {
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const h = await harness({ debug: true, idleCompactMinutes: 20 / MIN }, { contextFn: async () => { await gate; return [user("hi")]; }, idleAt: { same: () => Date.now() - 5000 } });
+    const b = body(150_000, { breakpoints: false });
+    await h.hooks.context(contextEvent("same", "omni/router-gpt", b));
+    const e = { sessionID: "same", kind: "primary", model: ref("omni/router-gpt"), request: req(b) };
+    await h.hooks["http.request"](e);
+    await sleep(60);
+    assert.equal(h.contexts.length, 1, "read in flight");
+    await h.hooks["http.response"]({ ...e, response: new Response(JSON.stringify({ usage: { input_tokens: 49000, output_tokens: 1000 } })) });
+    await sleep(20);
+    release();
+    await sleep(120);
+    assert.equal(h.compacted.length, 0, "50,000 is below compactMinTokens: no compaction on the stale character estimate");
+    assert.equal(sized(h), undefined, "no compact.idle logged with the character estimate");
+    assert.match(h.log(), /"compact.skip"[^\n]*"sessionID":"same"[^\n]*"reason":"below compactMinTokens"/);
+    h.cleanup();
+  }
+  // 2. an output-only record (no prompt counts) is not the anchor (core's hasMeasuredPrompt): the newest record with a
+  //    positive prompt count is, and the newer record counts as unmeasured text.
+  {
+    const prompt = assistant({ input: 1000, output: 100, reasoning: 0, cache: { read: 148900, write: 0 } }); // 150,000
+    const outputOnly = assistant({ input: 0, output: 1000, reasoning: 0, cache: { read: 0, write: 0 } });
+    const h = await harness({ idleCompactMinutes: 20 / MIN }, { contextFn: async () => [prompt, outputOnly] });
+    await turn(h, "outonly", "omni/router-gpt", body(150_000, { breakpoints: false }));
+    await sleep(120);
+    assert.equal(h.compacted.length, 1, "compacted on the 150,000-token prompt");
+    assert.equal(sized(h), Math.round(150000 + JSON.stringify([outputOnly]).length / 4), "anchored on the prompt record, not the output-only one");
+    assert.ok(Math.abs(sized(h) - 150000) < 100, "about 150,000");
+    h.cleanup();
   }
 }
 

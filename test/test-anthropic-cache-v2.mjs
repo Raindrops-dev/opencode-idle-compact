@@ -199,6 +199,8 @@ assert.ok(writes({ cost: [{ input: 1, output: 1, cache: { read: 0, write: 0 } },
   assert.equal(h.generated.length, 3, "stopped at maxIdleMinutes");
   const log = readFileSync(join(dir, "log.jsonl"), "utf8");
   assert.match(log, /"warm.send"/); assert.match(log, /"idle-limit"/);
+  const lines = log.trim().split("\n");
+  assert.ok(lines.length > 0 && lines.every((l) => JSON.parse(l).pid === process.pid), "every log line carries pid");
 
   // route change -> carrier aborted before any network call
   let routeAbort = false;
