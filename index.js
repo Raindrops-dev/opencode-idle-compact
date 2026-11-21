@@ -32,7 +32,10 @@
 // All are queued (`delivery: "queue"`), wait for the session to be idle, and are dropped if the session saw new real
 // activity meanwhile. Size comes from the last primary response's input (including cache writes/reads) plus output;
 // without usable usage, fall back to ~4 chars/token over system and messages, replaced at the idle check by the usage
-// OpenCode recorded in the session (`ctx.session.context`, as core sizes a prompt). Catalog economics decide (tier-aware at
+// OpenCode recorded in the session (`ctx.session.context`, as core sizes a prompt; a failed or non-array read logs
+// `compact.context-failed` with the error's tag or name only). Every character estimate counts typed inline media (a
+// `mime`/`mediaType`/`media_type` with a `data`/`uri` payload) as core does: image 1,500 tokens, PDF 2,000, other media
+// by its characters, not by its base64 text. Catalog economics decide (tier-aware at
 // that size, `cold` = cache-write price or
 // else input price): saving = rate * (tokens - 4000) * cold - (tokens * read price + 4000 * output price), with rate 1
 // for warm/root and `childResumeRate` for child. The read is priced warm by default except for native compaction;
@@ -251,6 +254,32 @@ function idleCompactID(sessionID, idleAt) {
 // message); over HTTP it is a ConflictError whose message says so.
 const isCompactionConflict = (error) => error?._tag === "Session.CompactionConflictError"
   || /conflicts with an existing durable record/.test(String(error?.message ?? ""));
+// Media sizes as OpenCode core's compaction.ts (v2.3.2) counts them: IMAGE_TOKEN_ESTIMATE, PDF_TOKEN_ESTIMATE, other media 0.
+const IMAGE_TOKEN_ESTIMATE = 1500;
+const PDF_TOKEN_ESTIMATE = 2000;
+const mediaTokens = (mime) => (mime.startsWith("image/") ? IMAGE_TOKEN_ESTIMATE : mime === "application/pdf" ? PDF_TOKEN_ESTIMATE : 0);
+// Tokens of a JSON value at ~4 chars/token. A typed media object (a string `mime`, `mediaType` or `media_type`, and a
+// string payload `data` or `uri`: a tool-result file, a user attachment, a context-hook asset or an Anthropic base64
+// source) counts as core counts it, by its image/PDF type, with the payload left out of the characters. Strings on their
+// own (a data URI included) and other media types stay text: core counts those media 0, keeping their characters is the old,
+// conservative size. Throws only like JSON.stringify (circular, BigInt).
+export function sizeTokens(value) {
+  let media = 0;
+  const json = JSON.stringify(value, (_k, v) => {
+    if (!v || typeof v !== "object" || Array.isArray(v)) return v;
+    const mime = [v.mime, v.mediaType, v.media_type].find((m) => typeof m === "string")?.toLowerCase();
+    const field = ["data", "uri"].find((f) => typeof v[f] === "string");
+    const tokens = mime && field ? mediaTokens(mime) : 0;
+    if (!tokens) return v;
+    media += tokens;
+    return { ...v, [field]: "" };
+  });
+  return (json?.length ?? 0) / 4 + media;
+}
+// A request body held as text (a stored request): parsed once; text that is not JSON keeps the plain character count.
+function textTokens(text) {
+  try { return sizeTokens(JSON.parse(text)); } catch { return text.length / 4; }
+}
 // Prompt size as OpenCode core measures it (`estimatePrompt`): the newest assistant message of the current provider with
 // a measured prompt (`hasMeasuredPrompt`: no error, input + cache read + cache write above 0; another provider's count may
 // describe a window this one cannot replay), plus ~4 chars/token for what that usage did not cover: the anchor's own
@@ -268,7 +297,7 @@ function contextTokens(messages, providerID) {
     .filter((c) => c?.type === "tool" && c.executed !== true && (c.state?.status === "completed" || c.state?.status === "error"))
     .map((c) => c.state.status === "error" ? { error: c.state.error, content: c.state.content ?? [] } : c.state.content).filter(Boolean); // as core replays them
   const unseen = [...results, ...messages.slice(i + 1)];
-  return measured > 0 ? measured + (unseen.length ? JSON.stringify(unseen).length / 4 : 0) : undefined;
+  return measured > 0 ? measured + (unseen.length ? sizeTokens(unseen) : 0) : undefined;
 }
 
 export default {
@@ -402,7 +431,7 @@ export default {
       }
       if (scope !== "warm" && s) return skip("plugin-warmed"); // its own final tick decides
       // Provider input + output from the last primary response; ~4 chars/token only when usage is unavailable.
-      let tokens = t.tokens ?? (s && s.text.length / 4);
+      let tokens = t.tokens ?? (s && textTokens(s.text));
       // Busy detection starts NOW, before the catalog await: a session busy when the timer fired must count as busy even
       // if it settles during that await, and catalog time must not count as wait time. The wait is timed inside the
       // wrapper. `w` never rejects ({ ok: false } = the wait failed), so no unhandled rejection.
@@ -413,7 +442,13 @@ export default {
       // The session's active context (an array), read once and only after the session settled, so it is never an in-flight sample.
       const hasContext = typeof ctx.session.context === "function";
       // A failed or non-array read is [] (no usable usage, nothing compacted), so it is not read a second time.
-      const readContext = async () => { try { const m = await ctx.session.context({ sessionID }); return Array.isArray(m) ? m : []; } catch { return []; } };
+      const readContext = async () => {
+        const failed = (error) => { log({ event: "compact.context-failed", sessionID, error }); return []; };
+        try {
+          const m = await ctx.session.context({ sessionID });
+          return Array.isArray(m) ? m : failed("not an array");
+        } catch (e) { return failed([e?._tag, e?.name].find((x) => typeof x === "string") ?? "error"); } // never the message: it can carry session content
+      };
       // No HTTP usage was seen (a route whose responses this plugin cannot read, such as a provider that keeps its own
       // session): the character estimate overstates the real context, so size from the usage OpenCode recorded.
       // A completed compaction with no usable anchor after it (another process or a hand compaction ran) replaced the basis
@@ -423,7 +458,7 @@ export default {
         const history = await readContext();
         let measured = contextTokens(history, (t.model ?? s?.model)?.providerID);
         const compacted = measured === undefined && history.some((m) => m?.type === "compaction" && m.status === "completed");
-        if (compacted) measured = JSON.stringify(history).length / 4;
+        if (compacted) measured = sizeTokens(history);
         // Apply only while nothing newer arrived during the read: same record, same activity, no HTTP usage since.
         const fresh = compacted || (was !== "usage" && was !== "session");
         if (measured !== undefined && fresh && track.get(sessionID) === t && t.seq === seq && !(t.sized === "usage" && was !== "usage")) { tokens = t.tokens = measured; t.sized = "session"; }
@@ -635,7 +670,10 @@ export default {
       const t = track.get(sessionID);
       if (t) {
         t.warm = true;
-        if (t.tokens === undefined) { t.tokens = text.length / 4; t.sized = "chars"; }
+        if (t.tokens === undefined) { // sizing never rejects a request: the plain character count is the fallback
+          try { t.tokens = sizeTokens(body); } catch { t.tokens = text.length / 4; }
+          t.sized = "chars";
+        }
         if (opt.compactOnIdle && !excluded(sessionID)) saveIdle(sessionID, t, now + opt.maxIdleMs);
         else if (opt.compactOnIdle) dropIdle(sessionID);
       }
@@ -648,7 +686,7 @@ export default {
       t.model = event.model;
       // New step's fallback; its primary response replaces this with provider usage once the stream ends.
       t.sized = "chars";
-      try { t.tokens = JSON.stringify({ system: event.system, messages: event.messages }).length / 4; } catch { t.tokens = undefined; }
+      try { t.tokens = sizeTokens({ system: event.system, messages: event.messages }); } catch { t.tokens = undefined; }
       if (t.child === undefined) {
         try { t.child = !!(await ctx.session.get({ sessionID }))?.parentID; } catch { t.child = false; }
       }

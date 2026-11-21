@@ -81,7 +81,11 @@ For priced models, the plugin compacts only when both of these are true:
 - The context has at least `compactMinTokens` tokens (default 100000). The size comes from the token counts in the
   provider's last reply. Without those counts, the plugin uses the token usage OpenCode recorded with the newest usable
   answer of the same provider, plus about 4 characters per token for what that usage did not cover. Without either, it
-  estimates about 4 characters per token over the serialized request.
+  estimates about 4 characters per token over the serialized request. In these character estimates, inline media that
+  carries its type (a `mime`, `mediaType` or `media_type` field next to its `data` or `uri`, as OpenCode and the
+  Anthropic request format store it) counts as 1,500 tokens for an image and 2,000 for a PDF, as OpenCode's own
+  estimate counts them, plus the characters of the rest of that object; its `data` or `uri` value is not counted. Other media
+  types, a bare data URI string and a request body that is not JSON count all their characters, base64 data included.
 - The expected saving is at least `compactSaveMin` US dollars (default 0.02).
 
 The expected saving is an estimate. It assumes that the session is resumed later, the summary is about 4000 tokens, and
@@ -346,7 +350,9 @@ This is a keep-alive request. Do not perform any work or use tools. Reply with e
 - **Routes without readable usage.** When the plugin never sees the provider's usage in an HTTP response, it sizes
   the session from the usage OpenCode recorded with the newest usable answer (no error, a positive prompt count) of the
   same provider, plus about 4 characters per token for what that usage did not cover. After a compaction with no such
-  answer since, or when the context cannot be read, it estimates about 4 characters per token.
+  answer since, or when the context cannot be read, it estimates about 4 characters per token. A failed read logs
+  `compact.context-failed` with the error's tag or name, `error` when it has neither, or `not an array` for an answer
+  that is not a list; never the error's message.
 - **OpenCode chooses the summary model.** The plugin never calls a model itself for the summary.
 
 ## Tests

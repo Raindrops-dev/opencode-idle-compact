@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
-import plugin from "../index.js";
+import plugin, { sizeTokens } from "../index.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -1332,6 +1332,146 @@ function fakeCore() {
     assert.equal(h.compacted.length, 1, "compacted on the 150,000-token prompt");
     assert.equal(sized(h), Math.round(150000 + JSON.stringify([outputOnly]).length / 4), "anchored on the prompt record, not the output-only one");
     assert.ok(Math.abs(sized(h) - 150000) < 100, "about 150,000");
+    h.cleanup();
+  }
+}
+
+// 13. typed inline media (a string `mime`/`mediaType`/`media_type` with a string `data`/`uri` payload) is sized as
+//     OpenCode core's compaction.ts (v2.3.2) sizes it (image 1,500 tokens, PDF 2,000), not by its base64 characters.
+//     Strings on their own and other media types stay text. A failed session.context read is logged, without its message.
+{
+  const MB = "A".repeat(1_000_000);
+  const assistant = (content = []) => ({ type: "assistant", id: "msg_a", model: { providerID: "omni", id: "router-gpt" }, content,
+    tokens: { input: 1000, output: 100, reasoning: 0, cache: { read: 48900, write: 0 } } }); // 50,000 measured
+  const sized = (h) => events(h).find((e) => e.event === "compact.idle")?.estimatedTokens;
+  const compactedHistory = (...more) => [{ type: "compaction", status: "completed", reason: "auto", summary: "S" }, ...more];
+  // Size of one context through each path with no provider usage; `at(h)` returns the estimate the idle decision logged.
+  const viaSession = async (history, id) => { // a completed compaction with no usable anchor: the whole context is sized
+    const h = await harness({ idleCompactMinutes: 20 / MIN, compactMinTokens: 1000 }, { contextFn: async () => history });
+    await turn(h, id, "sub/free", body(10, { breakpoints: false }));
+    await sleep(120);
+    const n = sized(h); h.cleanup(); return n;
+  };
+  const viaHook = async (messages, id) => { // the context hook's own fallback (no HTTP usage, no session.context)
+    const h = await harness({ idleCompactMinutes: 20 / MIN, compactMinTokens: 1000 });
+    await h.hooks.context({ sessionID: id, agent: "build", model: ref("sub/free"), system: [{ type: "text", text: "sys" }], messages, options: {}, tools: {} });
+    await sleep(120);
+    const n = sized(h); h.cleanup(); return n;
+  };
+  const viaBody = async (blocks, id) => { // the request-body fallback, observed in the persisted idle size
+    const storage = fakeStorage();
+    const h = await harness({ idleCompactMinutes: 60 / MIN, maxIdleMinutes: 60, compactMinTokens: 1 }, { storage });
+    const b = body(10);
+    b.messages.push(...blocks);
+    const e = { sessionID: id, kind: "primary", model: ref("acme/messages-pro"), request: req(b) };
+    await h.hooks["http.request"](e);
+    await h.hooks["http.response"]({ ...e, response: new Response("{}") });
+    await sleep(20); // the deadline is persisted in the background
+    const n = storage.map.get("idle/" + id)?.tokens; h.cleanup(); return { tokens: n, e };
+  };
+  const near = (n, media) => n >= media && n < media + 1000;
+
+  // Shape 1: a tool result file, `{ type: "file", uri: "data:<mime>;base64,...", mime, name }`, in the anchor's own results:
+  // about 50,000 + 1,500 (image) or + 2,000 (PDF), so no compaction at the default compactMinTokens 100,000 (the base64 text
+  // alone would count about 250,000). Other media (audio) stays text: its characters count, as before.
+  for (const [name, mime, media] of [["image", "image/png", 1500], ["pdf", "application/pdf", 2000]]) {
+    const file = { type: "file", uri: `data:${mime};base64,${MB}`, mime, name: "f" };
+    const messages = [{ type: "user", id: "msg_u", text: "hi" }, assistant([{ type: "tool", id: "t", name: "read", state: { status: "completed", input: {}, content: [file] }, time: {} }])];
+    const h = await harness({ idleCompactMinutes: 20 / MIN, compactMinTokens: 50_000 }, { contextFn: async () => messages });
+    await turn(h, "media-" + name, "omni/router-gpt", body(10, { breakpoints: false }));
+    await sleep(120);
+    assert.equal(h.compacted.length, 1, `${name}: sized above the 50,000 threshold`);
+    assert.ok(sized(h) >= 50_000 + media && sized(h) < 60_000, `${name}: about ${50_000 + media} tokens, got ${sized(h)}`);
+    h.cleanup();
+    const d = await harness({ debug: true, idleCompactMinutes: 20 / MIN }, { contextFn: async () => messages });
+    await turn(d, "media-default-" + name, "omni/router-gpt", body(10, { breakpoints: false }));
+    await sleep(120);
+    assert.equal(d.compacted.length, 0, `${name}: below the default compactMinTokens`);
+    assert.match(d.log(), /"compact.skip"[^\n]*"reason":"below compactMinTokens"/);
+    d.cleanup();
+  }
+  {
+    const audio = { type: "file", uri: `data:audio/wav;base64,${MB}`, mime: "audio/wav", name: "f" };
+    const n = await viaSession(compactedHistory({ type: "user", id: "msg_u", text: "hi" }, assistant([{ type: "tool", id: "t", name: "read", state: { status: "completed", input: {}, content: [audio] }, time: {} }])), "media-audio");
+    assert.ok(n >= 250_000, `other media keeps its characters (core counts 0, the old size is kept), got ${n}`);
+  }
+  // Shape 2: a user attachment in session.context, `files: [{ data: <raw base64>, mime, name, source }]`
+  {
+    const n = await viaSession(compactedHistory({ type: "user", id: "msg_u", text: "hi", files: [{ data: MB, mime: "image/png", name: "a.png", source: { type: "file", path: "/a.png" } }] }), "media-user-file");
+    assert.ok(near(n, 1500), `user attachment: image counted as 1,500 tokens, got ${n}`);
+  }
+  // Shape 3: the context hook's asset (core `Asset.toJSON()`), `{ type: "base64", data, mediaType }`
+  {
+    const n = await viaHook([{ role: "user", content: [{ type: "base64", data: MB, mediaType: "image/png" }] }], "media-hook");
+    assert.ok(near(n, 1500), `context hook asset: image counted as 1,500 tokens, got ${n}`);
+    const p = await viaHook([{ role: "user", content: [{ type: "base64", data: MB, mediaType: "application/pdf" }] }], "media-hook-pdf");
+    assert.ok(near(p, 2000), `context hook asset: PDF counted as 2,000 tokens, got ${p}`);
+  }
+  // Shape 4: the Anthropic request body, `source: { type: "base64", media_type, data }`; audio keeps its characters
+  for (const [mime, media] of [["image/png", 1500], ["application/pdf", 2000]]) {
+    const { tokens } = await viaBody([{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: mime, data: MB }, cache_control: { type: "ephemeral" } }] }], "media-body");
+    assert.ok(near(tokens, media), `${mime}: body fallback counts ${media} tokens for the block, got ${tokens}`);
+  }
+  {
+    const { tokens } = await viaBody([{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: "audio/wav", data: MB }, cache_control: { type: "ephemeral" } }] }], "media-body-audio");
+    assert.ok(tokens >= 250_000, `audio: body fallback keeps its characters, got ${tokens}`);
+  }
+
+  // Regression: a tool-call input that only looks like a media block must not throw, and the request goes through intact
+  {
+    const input = { type: "base64", media_type: 1, data: "x" };
+    const { tokens, e } = await viaBody([{ role: "assistant", content: [{ type: "tool_use", id: "tu", name: "write", input, cache_control: { type: "ephemeral" } }] }], "media-lookalike");
+    assert.ok(tokens > 0 && tokens < 1000, `look-alike input sized as text, got ${tokens}`);
+    assert.ok(JSON.stringify(await e.request.clone().json()).includes('"media_type":1'), "the request still carries the tool input");
+    assert.equal(sizeTokens({ type: "base64", media_type: 1, data: "x" }), JSON.stringify({ type: "base64", media_type: 1, data: "x" }).length / 4);
+  }
+  // Regression: a user text that merely starts like a data URI is text, counted at its characters
+  {
+    const n = await viaHook([{ role: "user", content: [{ type: "text", text: "data:text/plain;base64," + MB }] }], "media-text");
+    assert.ok(n >= 250_000, `a data-URI-looking string stays text, got ${n}`);
+    const m2 = await viaHook([{ role: "user", content: [{ type: "text", text: "data:image/png;base64," + MB }] }], "media-text-image");
+    assert.ok(m2 >= 250_000, `a data-URI string with no typed media object stays text, got ${m2}`);
+  }
+  // Regression: MIME case, a long data-URI parameter, and a raw-base64 uri with `mime`
+  for (const [name, file] of [
+    ["IMAGE/PNG", { type: "file", uri: `data:IMAGE/PNG;base64,${MB}`, mime: "IMAGE/PNG", name: "f" }],
+    ["long data-URI parameter", { type: "file", uri: `data:image/png;name=${"n".repeat(300)};base64,${MB}`, mime: "image/png", name: "f" }],
+    ["raw base64 uri", { type: "file", uri: MB, mime: "image/png", name: "f" }],
+  ]) {
+    const n = await viaHook([{ role: "user", content: [file] }], "media-case");
+    assert.ok(near(n, 1500), `${name}: counted as 1,500 tokens, got ${n}`);
+  }
+
+  // A failed or non-array session.context read: one compact.context-failed line (session and error class only), and the
+  // decision uses the earlier (character) size as before; a usable or empty array logs nothing
+  const MARKER = "SECRET-MARKER-9f3a";
+  for (const [name, contextFn, error] of [
+    ["throws", async () => { throw new Error(`context unavailable ${MARKER}`); }, "Error"],
+    ["throws a tagged object", async () => { throw { _tag: "Session.NotFound", message: MARKER }; }, "Session.NotFound"],
+    ["throws a string", async () => { throw MARKER; }, "error"],
+    ["throws a non-string tag", async () => { throw { _tag: { m: MARKER } }; }, "error"],
+    ["not an array", async () => ({ data: [], marker: MARKER }), "not an array"],
+    ["undefined", async () => undefined, "not an array"],
+  ]) {
+    const b = body(150_000, { breakpoints: false });
+    const h = await harness({ idleCompactMinutes: 20 / MIN }, { contextFn });
+    await turn(h, "ctx-failed", "omni/router-gpt", b);
+    await sleep(120);
+    const failed = events(h).filter((e) => e.event === "compact.context-failed");
+    assert.equal(failed.length, 1, `${name}: one compact.context-failed line`);
+    assert.equal(failed[0].sessionID, "ctx-failed");
+    assert.equal(failed[0].error, error, `${name}: error`);
+    assert.deepEqual(Object.keys(failed[0]).sort(), ["error", "event", "pid", "sessionID", "t"], `${name}: no content in the line`);
+    assert.ok(!h.log().includes(MARKER), `${name}: the marker is not in the log`);
+    assert.equal(h.compacted.length, 1, `${name}: compacted on the earlier size`);
+    assert.equal(sized(h), Math.round(JSON.stringify({ system: b.system, messages: b.messages }).length / 4), `${name}: earlier size`);
+    h.cleanup();
+  }
+  for (const [name, contextFn] of [["empty array", async () => []], ["usable array", async () => [assistant()]]]) {
+    const h = await harness({ idleCompactMinutes: 20 / MIN }, { contextFn });
+    await turn(h, "ctx-ok", "omni/router-gpt", body(150_000, { breakpoints: false }));
+    await sleep(120);
+    assert.doesNotMatch(h.log(), /compact.context-failed/, `${name}: no failure logged`);
     h.cleanup();
   }
 }
